@@ -8,11 +8,11 @@
 
 ## What this is
 
-This is a local Windows status display for Codex. The computer reads task and quota information from Codex Desktop, then sends a monochrome frame to the display over Bluetooth. No data cable, firmware flashing, or ESP development board is required.
+This small Windows tool puts Codex Desktop's task and quota information on a desk e-ink display. The computer reads the state and sends a monochrome frame to the display over Bluetooth. There is no data cable, firmware flashing, or separate ESP board involved.
 
 An e-ink panel is not a phone screen: the program triggers an update quickly, but the panel usually needs a few more seconds to complete its physical refresh. Task status is therefore not guaranteed to appear instantly; the actual delay depends on the full refresh waveform, Bluetooth transfer, and device state.
 
-It is designed for people who want an inexpensive e-ink panel on their desk to glance at Codex status without keeping the Codex window open.
+It is meant for anyone who wants a simple, inexpensive desk display for Codex instead of keeping the Codex window open all the time.
 
 ## What you can see
 
@@ -22,7 +22,7 @@ It is designed for people who want an inexpensive e-ink panel on their desk to g
 - up to 8 bottom status slots, arranged as 4 on the top row and 4 on the bottom row;
 - quick refresh triggers after task changes and automatic quota updates; the visible screen may still lag by a few seconds.
 
-On the low-cost end, this **may be one of the cheapest Codex quota monitor solutions currently available**. Based on the author's purchase experience, similar devices on Pinduoduo can cost about RMB 15 after coupons. In low-frequency use, one charge has lasted more than two months in the author's testing. Price and battery life vary with promotions, battery capacity, refresh frequency, and hardware batch.
+Based on the author's purchase experience, similar devices on Pinduoduo can cost about RMB 15 after coupons. In low-frequency use, one charge has lasted more than two months in testing. Price and battery life vary with promotions, battery capacity, refresh frequency, and hardware batch. For this kind of low-cost setup, it may be one of the cheapest Codex quota monitor solutions currently available.
 
 ## How to read the screen
 
