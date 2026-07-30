@@ -32,11 +32,16 @@ Codex 在后台运行任务时，电脑上的窗口可能被其他工作遮住�
 
 所有读取和渲染都在本机完成，图片通过本机蓝牙发送到墨水屏。本项目不会把 prompt、回复内容或完整会话上传到云端，日志也只记录摘要和运行结果。设备地址、扫描参数和本机路径属于个人配置，不应提交到公开仓库；请从 `config.example.json` 复制出自己的 `config.json`。
 
-## 已安装
+## 安装与运行
 
-项目目录内已经创建 `.venv`，并安装 Pillow、Bleak 和 Windows WinRT 蓝牙依赖。
+在 Windows PowerShell 中进入项目目录，先创建虚拟环境并安装 Pillow、Bleak、Watchdog 等依赖：
 
-在 PowerShell 中进入本目录后可直接运行：
+```powershell
+.\install.ps1
+Copy-Item .\config.example.json .\config.json
+```
+
+然后在 `config.json` 中填写自己的墨水屏蓝牙地址（或保留为空，让程序扫描 `SKD-CLOCK` 前缀的设备），再运行：
 
 ```powershell
 .\start.ps1 preview --all --output previews
