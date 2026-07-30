@@ -1,5 +1,7 @@
 # Codex 墨水屏监控
 
+**中文** | [English](README_EN.md)
+
 这是一个把 Codex Desktop 状态放到廉价蓝牙墨水屏上的本地小工具。它适合这样的人：想买一块便宜的 `SKD-CLOCK` 一类 212×104 单色墨水屏，放在桌面上持续看 Codex 额度和任务状态，而不必一直打开 Codex 窗口。
 
 ![Codex 墨水屏实拍效果](docs/images/codex-eink-real-device.jpg)
