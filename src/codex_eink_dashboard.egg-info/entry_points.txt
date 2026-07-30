@@ -1,0 +1,2 @@
+[console_scripts]
+codex-eink = codex_eink.cli:main

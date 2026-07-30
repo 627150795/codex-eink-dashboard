@@ -1,0 +1,7 @@
+Metadata-Version: 2.4
+Name: codex-eink-dashboard
+Version: 0.1.0
+Summary: Local Codex task and quota dashboard for SKD-CLOCK e-ink displays
+Requires-Python: >=3.11
+Requires-Dist: Pillow>=10.0
+Requires-Dist: bleak>=0.22
