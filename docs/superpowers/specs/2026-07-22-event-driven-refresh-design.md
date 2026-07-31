@@ -15,12 +15,15 @@ attempt unsupported partial panel refreshes or firmware changes.
 ## Event sources and scheduling
 
 The background service watches the local Codex session tree, session index,
-and unread-thread state file. The thread-state and activity databases are read
-during collection but are not watched, because the local quota reader writes
-both databases. A
-change to any watched source signals one pending render. Events are coalesced
-for the configured short quiet period so one Codex update that writes several
-files creates at most one frame attempt.
+unread-thread state file, and the thread-state/activity databases used by the
+collector. A change to any watched source signals one pending render. Events
+are coalesced for the configured short quiet period so one Codex update that
+writes several files creates at most one frame attempt.
+
+Database-only events render without starting the live quota reader. The quota
+reader itself can write those databases, so this guard prevents its own side
+effects from creating a refresh loop. The normal 30/60-second fallback still
+runs the live quota read.
 
 After the quiet period, the service collects the latest view and compares its
 frame hash with the last successful frame. An unchanged frame performs no BLE

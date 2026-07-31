@@ -1,9 +1,7 @@
 from __future__ import annotations
 
 from .models import DashboardView, ProjectState, ProjectStatus, QuotaState
-
-
-TERMINAL_STATUS_TTL = 2 * 60 * 60
+from .notifications import terminal_notification_projects
 
 
 def reduce_dashboard(
@@ -31,39 +29,20 @@ def reduce_dashboard(
         seen.add(item.alert_id)
         alerts.append(item)
 
-    status_projects = list(active)
-    seen_status = {item.alert_id for item in active}
-    for item in sorted(projects, key=lambda project: project.updated_at, reverse=True):
-        if (
-            item.status != ProjectStatus.DONE
-            or not item.unread
-            or now - item.updated_at >= TERMINAL_STATUS_TTL
-            or item.alert_id in seen_status
-        ):
-            continue
-        seen_status.add(item.alert_id)
-        status_projects.append(item)
-    for item in sorted(projects, key=lambda project: project.updated_at, reverse=True):
-        if (
-            item.status != ProjectStatus.ERROR
-            or not item.unread
-            or now - item.updated_at >= TERMINAL_STATUS_TTL
-            or item.alert_id in seen_status
-        ):
-            continue
-        seen_status.add(item.alert_id)
-        status_projects.append(item)
+    terminal_notifications = terminal_notification_projects(projects, now=now)
+    active_alert_ids = {item.alert_id for item in active}
+    status_projects = list(active) + [item for item in terminal_notifications if item.alert_id not in active_alert_ids]
 
     fresh = now - last_success_at <= (2 * poll_seconds + 15)
     if not fresh:
         global_status = "OFFLINE"
     elif quota.exhausted:
         global_status = "LIMIT"
-    elif any(item.status == ProjectStatus.ERROR and item.unread for item in alerts):
+    elif any(item.status == ProjectStatus.ERROR for item in terminal_notifications):
         global_status = "ERR"
     elif active:
         global_status = "WAIT" if any(item.status == ProjectStatus.WAITING for item in active) else "RUN"
-    elif any(item.status == ProjectStatus.DONE and item.unread for item in alerts):
+    elif any(item.status == ProjectStatus.DONE for item in terminal_notifications):
         global_status = "DONE"
     else:
         global_status = "IDLE"

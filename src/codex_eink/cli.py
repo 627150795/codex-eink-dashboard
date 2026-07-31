@@ -13,7 +13,8 @@ from PIL import Image
 from .ble import BleTransport, DeviceStatus
 from .config import AppConfig
 from .events import CodexEventWatcher
-from .models import DashboardView, ProjectStatus, QuotaState, SUPPORTED_RESOLUTIONS
+from .models import DashboardView, QuotaState, SUPPORTED_RESOLUTIONS
+from .notifications import apply_terminal_notification_state
 from .protocol import build_bw_packets, build_bwr_packets
 from .quota import read_live_quota, read_quota_fallback
 from .reducer import reduce_dashboard
@@ -57,13 +58,7 @@ def collect_view(config: AppConfig, *, live_quota: bool = True) -> DashboardView
     live_ids = load_recent_thread_ids(codex_home / "logs_2.sqlite", now=now)
     projects = reconcile_live_activity(projects, live_ids, now=now)
     unread_ids = load_unread_thread_ids(codex_home / ".codex-global-state.json")
-    projects = [
-        dataclasses.replace(
-            project,
-            unread=project.status in {ProjectStatus.DONE, ProjectStatus.ERROR} and project.session_id in unread_ids,
-        )
-        for project in projects
-    ]
+    projects = apply_terminal_notification_state(projects, unread_ids, now=now)
     if config.privacy_mode == "titles":
         projects = [dataclasses.replace(item, summary="") for item in projects]
     quota = QuotaState(plan_type="api") if config.account_mode == "api" else QuotaState()
@@ -154,7 +149,13 @@ def _build_packets(config: AppConfig, image: Image.Image, status: DeviceStatus, 
     return build_bw_packets(image, image_index=config.image_index)
 
 
-async def _once(config: AppConfig, *, force: bool, preview_path: Path) -> tuple[str, object]:
+async def _once(
+    config: AppConfig,
+    *,
+    force: bool,
+    preview_path: Path,
+    live_quota: bool = True,
+) -> tuple[str, object]:
     """Content-first update path.
 
     1. Render with cached resolution + stabilized battery (no BLE).
@@ -177,7 +178,7 @@ async def _once(config: AppConfig, *, force: bool, preview_path: Path) -> tuple[
         if config.resolution is not None and config.resolution != status.resolution:
             raise ValueError(f"configured resolution {config.resolution} does not match device {status.resolution}")
         battery_display = quantize_battery_voltage(status.voltage, battery_display)
-        view = dataclasses.replace(collect_view(config), battery_voltage=battery_display)
+        view = dataclasses.replace(collect_view(config, live_quota=live_quota), battery_voltage=battery_display)
         image = render_dashboard(view, resolution, orientation=config.orientation)
         image.save(preview_path, format="PNG", optimize=False)
         digest = frame_digest(image)
@@ -191,7 +192,7 @@ async def _once(config: AppConfig, *, force: bool, preview_path: Path) -> tuple[
         return f"uploaded {len(packets)} packets", uploaded
 
     # Normal path: decide from local content first.
-    view = dataclasses.replace(collect_view(config), battery_voltage=battery_display)
+    view = dataclasses.replace(collect_view(config, live_quota=live_quota), battery_voltage=battery_display)
     image = render_dashboard(view, resolution, orientation=config.orientation)
     image.save(preview_path, format="PNG", optimize=False)
     digest = frame_digest(image)
@@ -250,10 +251,18 @@ def command_run(args) -> int:
     config = _config(args.config)
     preview = Path(args.preview)
     assert config.codex_home is not None
+    refresh_live_quota = True
     with CodexEventWatcher(config.codex_home) as watcher:
         while True:
             try:
-                result, _status = asyncio.run(_once(config, force=False, preview_path=preview))
+                result, _status = asyncio.run(
+                    _once(
+                        config,
+                        force=False,
+                        preview_path=preview,
+                        live_quota=refresh_live_quota,
+                    )
+                )
                 print(time.strftime("%Y-%m-%d %H:%M:%S"), result, flush=True)
                 view = collect_view(config, live_quota=False)
                 delay = config.active_poll_seconds if view.active_projects else config.idle_poll_seconds
@@ -263,11 +272,15 @@ def command_run(args) -> int:
                 print(time.strftime("%Y-%m-%d %H:%M:%S"), f"retry: {exc}", file=sys.stderr, flush=True)
                 delay = config.active_poll_seconds
             try:
-                wait_for_refresh(
+                event_triggered = wait_for_refresh(
                     watcher,
                     fallback_seconds=delay,
                     coalesce_seconds=config.coalesce_seconds,
                 )
+                if event_triggered:
+                    refresh_live_quota = not CodexEventWatcher.only_database_sources(watcher.consume_sources())
+                else:
+                    refresh_live_quota = True
             except KeyboardInterrupt:
                 return 0
 

@@ -14,6 +14,14 @@ _ROOT_FILES = {
     "session_index.jsonl",
     ".codex-global-state.json",
 }
+_DATABASE_SOURCES = {
+    "state_5.sqlite": "state_db",
+    "state_5.sqlite-wal": "state_db",
+    "state_5.sqlite-shm": "state_db",
+    "logs_2.sqlite": "activity_db",
+    "logs_2.sqlite-wal": "activity_db",
+    "logs_2.sqlite-shm": "activity_db",
+}
 
 
 class _CodexChangeHandler(FileSystemEventHandler):
@@ -27,8 +35,10 @@ class _CodexChangeHandler(FileSystemEventHandler):
         destination = getattr(event, "dest_path", None)
         if destination:
             paths.append(destination)
-        if any(self.watcher.is_relevant_path(path) for path in paths):
-            self.watcher.signal()
+        for path in paths:
+            if self.watcher.is_relevant_path(path):
+                self.watcher.signal(path)
+                return
 
 
 class CodexEventWatcher:
@@ -40,25 +50,60 @@ class CodexEventWatcher:
         self._event = threading.Event()
         self._lock = threading.Lock()
         self._last_signal_at: float | None = None
+        self._pending_sources: set[str] = set()
         self._observer: Observer | None = None
 
     def is_relevant_path(self, path: str | Path) -> bool:
+        relative = self._relative_path(path)
+        if relative is None:
+            return False
+        if relative.name in _ROOT_FILES and len(relative.parts) == 1:
+            return True
+        if len(relative.parts) == 1 and relative.name in _DATABASE_SOURCES:
+            return True
+        return bool(relative.parts and relative.parts[0] == "sessions" and relative.suffix == ".jsonl")
+
+    def _relative_path(self, path: str | Path) -> Path | None:
         root = os.path.normcase(os.path.abspath(self.codex_home))
         candidate = os.path.normcase(os.path.abspath(path))
         try:
             relative = Path(os.path.relpath(candidate, root))
         except ValueError:
-            return False
+            return None
         if relative.parts and relative.parts[0] == "..":
-            return False
-        if relative.name in _ROOT_FILES and len(relative.parts) == 1:
-            return True
-        return bool(relative.parts and relative.parts[0] == "sessions" and relative.suffix == ".jsonl")
+            return None
+        return relative
 
-    def signal(self) -> None:
+    def source_for_path(self, path: str | Path) -> str | None:
+        relative = self._relative_path(path)
+        if relative is None:
+            return None
+        if relative.parts and relative.parts[0] == "sessions" and relative.suffix == ".jsonl":
+            return "rollout"
+        if len(relative.parts) == 1 and relative.name == "session_index.jsonl":
+            return "session_index"
+        if len(relative.parts) == 1 and relative.name == ".codex-global-state.json":
+            return "unread"
+        if len(relative.parts) == 1:
+            return _DATABASE_SOURCES.get(relative.name)
+        return None
+
+    def signal(self, path: str | Path | None = None) -> None:
         with self._lock:
             self._last_signal_at = self._clock()
+            source = self.source_for_path(path) if path is not None else None
+            self._pending_sources.add(source or "unknown")
             self._event.set()
+
+    def consume_sources(self) -> frozenset[str]:
+        with self._lock:
+            sources = frozenset(self._pending_sources)
+            self._pending_sources.clear()
+            return sources
+
+    @staticmethod
+    def only_database_sources(sources: frozenset[str]) -> bool:
+        return bool(sources) and sources.issubset({"state_db", "activity_db"})
 
     def wait(self, timeout: float | None) -> bool:
         return self._event.wait(timeout)

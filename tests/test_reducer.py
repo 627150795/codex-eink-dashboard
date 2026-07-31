@@ -71,6 +71,18 @@ class ReducerTests(unittest.TestCase):
         self.assertEqual(view.status_projects, ())
         self.assertEqual(view.global_status, "IDLE")
 
+    def test_expired_terminal_notification_cannot_keep_global_done_status(self):
+        done = ProjectState("done", "Done", ProjectStatus.DONE, 1, unread=True)
+        view = reduce_dashboard(
+            [done],
+            QuotaState(),
+            now=7202,
+            last_success_at=7202,
+            completion_ttl=10000,
+        )
+        self.assertEqual(view.status_projects, ())
+        self.assertEqual(view.global_status, "IDLE")
+
 
 if __name__ == "__main__":
     unittest.main()
