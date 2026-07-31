@@ -2,6 +2,8 @@
 
 **中文** | [English](README_EN.md)
 
+社区链接：[LINUX DO](https://linux.do/)
+
 ![Codex 墨水屏实拍效果](docs/images/codex-eink-real-device.jpg)
 
 > 用一块便宜的蓝牙墨水屏，通过**无线连接**显示 Codex 的额度和任务状态。
