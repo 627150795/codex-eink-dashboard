@@ -6,6 +6,7 @@ import dataclasses
 import json
 import sys
 import time
+from collections.abc import Callable, Iterable
 from pathlib import Path
 
 from PIL import Image
@@ -21,10 +22,20 @@ from .reducer import reduce_dashboard
 from .render import render_dashboard
 from .logstats import default_log_path, filter_days, format_report, load_log, recent_day_bounds
 from .service import FrameCache, frame_digest, quantize_battery_voltage, quantize_sync_time, should_upload
-from .sessions import collect_projects, load_recent_thread_ids, load_session_titles, load_state_titles, load_unread_thread_ids, reconcile_live_activity
+from .sessions import SessionSnapshotCache, TitleSnapshotCache, collect_projects, load_recent_thread_ids, load_session_titles, load_state_titles, load_unread_thread_ids, reconcile_live_activity
 
 
 _LAST_SUCCESSFUL_LIVE_QUOTA: QuotaState | None = None
+# ponytail: fixed short poll until Codex exposes a quota-change event.
+_QUOTA_POLL_SECONDS = 60
+_QUOTA_RESET_MIN_PERCENT = 98
+
+
+@dataclasses.dataclass(frozen=True)
+class UpdateOutcome:
+    message: str
+    status: DeviceStatus | None
+    has_active_projects: bool
 
 
 def _config(path: str | None) -> AppConfig:
@@ -41,6 +52,7 @@ def _read_live_quota_with_retry() -> QuotaState | None:
                 time.sleep(0.25)
             continue
         if quota.primary or quota.secondary or (quota.plan_type or "").casefold() == "api":
+            quota = _stabilize_live_quota(_LAST_SUCCESSFUL_LIVE_QUOTA, quota)
             _LAST_SUCCESSFUL_LIVE_QUOTA = quota
             return quota
         if attempt == 0:
@@ -48,12 +60,48 @@ def _read_live_quota_with_retry() -> QuotaState | None:
     return None
 
 
-def collect_view(config: AppConfig, *, live_quota: bool = True) -> DashboardView:
+def _stabilize_live_quota(previous: QuotaState | None, current: QuotaState) -> QuotaState:
+    if previous is None:
+        return current
+
+    def stable_window(previous_window, current_window):
+        if (
+            previous_window is not None
+            and current_window is not None
+            and current_window.remaining_percent > previous_window.remaining_percent
+            and current_window.remaining_percent < _QUOTA_RESET_MIN_PERCENT
+        ):
+            return previous_window
+        return current_window
+
+    primary = stable_window(previous.primary, current.primary)
+    secondary = stable_window(previous.secondary, current.secondary)
+    if primary is current.primary and secondary is current.secondary:
+        return current
+    return dataclasses.replace(current, primary=primary, secondary=secondary)
+
+
+def collect_view(
+    config: AppConfig,
+    *,
+    live_quota: bool = True,
+    use_quota_fallback: bool = True,
+    project_cache: SessionSnapshotCache | None = None,
+    changed_rollouts: Iterable[str | Path] | None = None,
+    title_cache: TitleSnapshotCache | None = None,
+    changed_sources: Iterable[str] | None = None,
+) -> DashboardView:
     codex_home = config.codex_home
     assert codex_home is not None
-    titles = load_session_titles(codex_home / "session_index.jsonl")
-    titles.update(load_state_titles(codex_home / "state_5.sqlite"))
-    projects = collect_projects(codex_home / "sessions", titles)
+    if title_cache is None:
+        titles = load_session_titles(codex_home / "session_index.jsonl")
+        titles.update(load_state_titles(codex_home / "state_5.sqlite"))
+    else:
+        titles = title_cache.collect(changed_sources=changed_sources)
+    if project_cache is None:
+        projects = collect_projects(codex_home / "sessions", titles)
+    else:
+        projects = project_cache.collect(titles, changed_paths=changed_rollouts)
     now = time.time()
     live_ids = load_recent_thread_ids(codex_home / "logs_2.sqlite", now=now)
     projects = reconcile_live_activity(projects, live_ids, now=now)
@@ -68,8 +116,11 @@ def collect_view(config: AppConfig, *, live_quota: bool = True) -> DashboardView
             quota = live_quota_value
         elif _LAST_SUCCESSFUL_LIVE_QUOTA is not None:
             quota = _LAST_SUCCESSFUL_LIVE_QUOTA
+    elif not live_quota and config.account_mode != "api" and _LAST_SUCCESSFUL_LIVE_QUOTA is not None:
+        quota = _LAST_SUCCESSFUL_LIVE_QUOTA
     if (
-        quota.primary is None
+        use_quota_fallback
+        and quota.primary is None
         and quota.secondary is None
         and (quota.plan_type or "").casefold() != "api"
     ):
@@ -155,7 +206,13 @@ async def _once(
     force: bool,
     preview_path: Path,
     live_quota: bool = True,
-) -> tuple[str, object]:
+    use_quota_fallback: bool = True,
+    project_cache: SessionSnapshotCache | None = None,
+    changed_rollouts: Iterable[str | Path] | None = None,
+    title_cache: TitleSnapshotCache | None = None,
+    changed_sources: Iterable[str] | None = None,
+    is_stale: Callable[[], bool] | None = None,
+) -> UpdateOutcome:
     """Content-first update path.
 
     1. Render with cached resolution + stabilized battery (no BLE).
@@ -170,34 +227,68 @@ async def _once(
     battery_display = _cached_battery(cached)
     previous = cached.get("frame_digest")
     preview_path.parent.mkdir(parents=True, exist_ok=True)
+    stale = is_stale or (lambda: False)
+
+    def current_view() -> DashboardView:
+        return collect_view(
+            config,
+            live_quota=live_quota,
+            use_quota_fallback=use_quota_fallback,
+            project_cache=project_cache,
+            changed_rollouts=changed_rollouts,
+            title_cache=title_cache,
+            changed_sources=changed_sources,
+        )
 
     # Bootstrap: resolution unknown — must probe once, then continue content-first.
     if resolution is None:
-        status = await transport.probe()
-        resolution = status.resolution
-        if config.resolution is not None and config.resolution != status.resolution:
-            raise ValueError(f"configured resolution {config.resolution} does not match device {status.resolution}")
-        battery_display = quantize_battery_voltage(status.voltage, battery_display)
-        view = dataclasses.replace(collect_view(config, live_quota=live_quota), battery_voltage=battery_display)
-        image = render_dashboard(view, resolution, orientation=config.orientation)
-        image.save(preview_path, format="PNG", optimize=False)
-        digest = frame_digest(image)
-        if not force and not should_upload(digest, previous):
-            cache.save(digest=digest, synced_at=time.time(), resolution=resolution, battery_display=battery_display)
-            return "unchanged", status
+        async def bootstrap_session(client):
+            status = await transport._read_status(client)
+            live_resolution = status.resolution
+            if config.resolution is not None and config.resolution != live_resolution:
+                raise ValueError(f"configured resolution {config.resolution} does not match device {live_resolution}")
+            live_battery = quantize_battery_voltage(status.voltage, battery_display)
+            view = dataclasses.replace(current_view(), battery_voltage=live_battery)
+            image = render_dashboard(view, live_resolution, orientation=config.orientation)
+            digest = frame_digest(image)
+            if not force and not should_upload(digest, previous):
+                if not preview_path.exists():
+                    image.save(preview_path, format="PNG", optimize=False)
+                cache.save(
+                    digest=digest,
+                    synced_at=time.time(),
+                    resolution=live_resolution,
+                    battery_display=live_battery,
+                )
+                return UpdateOutcome("unchanged", status, bool(view.active_projects))
+            if not force and stale():
+                return UpdateOutcome("superseded", status, bool(view.active_projects))
+            packets = _build_packets(config, image, status, live_resolution)
+            await transport.write_packets(client, packets, expected_resolution=live_resolution, status=status)
+            image.save(preview_path, format="PNG", optimize=False)
+            cache.save(
+                digest=digest,
+                synced_at=time.time(),
+                resolution=live_resolution,
+                battery_display=live_battery,
+            )
+            return UpdateOutcome(f"uploaded {len(packets)} packets", status, bool(view.active_projects))
 
-        packets = _build_packets(config, image, status, resolution)
-        uploaded = await transport.upload(packets, expected_resolution=resolution, retries=2)
-        cache.save(digest=digest, synced_at=time.time(), resolution=resolution, battery_display=battery_display)
-        return f"uploaded {len(packets)} packets", uploaded
+        return await transport.with_client(bootstrap_session, retries=2)
 
     # Normal path: decide from local content first.
-    view = dataclasses.replace(collect_view(config, live_quota=live_quota), battery_voltage=battery_display)
+    view = dataclasses.replace(
+        current_view(),
+        battery_voltage=battery_display,
+    )
     image = render_dashboard(view, resolution, orientation=config.orientation)
-    image.save(preview_path, format="PNG", optimize=False)
     digest = frame_digest(image)
     if not force and not should_upload(digest, previous):
-        return "unchanged", None
+        if not preview_path.exists():
+            image.save(preview_path, format="PNG", optimize=False)
+        return UpdateOutcome("unchanged", None, bool(view.active_projects))
+    if not force and stale():
+        return UpdateOutcome("superseded", None, bool(view.active_projects))
 
     async def session(client):
         status = await transport._read_status(client)
@@ -206,37 +297,40 @@ async def _once(
         live_battery = quantize_battery_voltage(status.voltage, battery_display)
         live_view = dataclasses.replace(view, battery_voltage=live_battery)
         live_image = render_dashboard(live_view, resolution, orientation=config.orientation)
-        live_image.save(preview_path, format="PNG", optimize=False)
         live_digest = frame_digest(live_image)
         if not force and not should_upload(live_digest, previous):
+            if not preview_path.exists():
+                live_image.save(preview_path, format="PNG", optimize=False)
             cache.save(
                 digest=live_digest,
                 synced_at=time.time(),
                 resolution=resolution,
                 battery_display=live_battery,
             )
-            return "unchanged", status, live_digest, live_battery, 0
+            return UpdateOutcome("unchanged", status, bool(live_view.active_projects))
+        if not force and stale():
+            return UpdateOutcome("superseded", status, bool(live_view.active_projects))
 
         packets = _build_packets(config, live_image, status, resolution)
         await transport.write_packets(client, packets, expected_resolution=resolution, status=status)
+        live_image.save(preview_path, format="PNG", optimize=False)
         cache.save(
             digest=live_digest,
             synced_at=time.time(),
             resolution=resolution,
             battery_display=live_battery,
         )
-        return f"uploaded {len(packets)} packets", status, live_digest, live_battery, len(packets)
+        return UpdateOutcome(f"uploaded {len(packets)} packets", status, bool(live_view.active_projects))
 
-    result, status, _digest, _battery, _count = await transport.with_client(session, retries=2)
-    return result, status
+    return await transport.with_client(session, retries=2)
 
 
 def command_once(args) -> int:
     config = _config(args.config)
-    result, status = asyncio.run(_once(config, force=args.force, preview_path=Path(args.preview)))
-    print(result)
-    if status is not None:
-        print(json.dumps(dataclasses.asdict(status), ensure_ascii=False, indent=2))
+    outcome = asyncio.run(_once(config, force=args.force, preview_path=Path(args.preview)))
+    print(outcome.message)
+    if outcome.status is not None:
+        print(json.dumps(dataclasses.asdict(outcome.status), ensure_ascii=False, indent=2))
     return 0
 
 
@@ -252,35 +346,57 @@ def command_run(args) -> int:
     preview = Path(args.preview)
     assert config.codex_home is not None
     refresh_live_quota = True
+    next_quota_poll_at = time.monotonic()
+    project_cache = SessionSnapshotCache(config.codex_home / "sessions")
+    title_cache = TitleSnapshotCache(config.codex_home)
+    changed_rollouts: Iterable[str | Path] | None = None
+    changed_sources: Iterable[str] | None = None
     with CodexEventWatcher(config.codex_home) as watcher:
         while True:
             try:
-                result, _status = asyncio.run(
+                revision = watcher.revision
+                outcome = asyncio.run(
                     _once(
                         config,
                         force=False,
                         preview_path=preview,
                         live_quota=refresh_live_quota,
+                        use_quota_fallback=refresh_live_quota,
+                        project_cache=project_cache,
+                        changed_rollouts=changed_rollouts,
+                        title_cache=title_cache,
+                        changed_sources=changed_sources,
+                        is_stale=lambda expected=revision: watcher.revision != expected,
                     )
                 )
-                print(time.strftime("%Y-%m-%d %H:%M:%S"), result, flush=True)
-                view = collect_view(config, live_quota=False)
-                delay = config.active_poll_seconds if view.active_projects else config.idle_poll_seconds
+                changed_rollouts = frozenset()
+                changed_sources = frozenset()
+                print(time.strftime("%Y-%m-%d %H:%M:%S"), outcome.message, flush=True)
+                delay = config.active_poll_seconds if outcome.has_active_projects else config.idle_poll_seconds
+                if refresh_live_quota:
+                    next_quota_poll_at = time.monotonic() + _QUOTA_POLL_SECONDS
             except KeyboardInterrupt:
                 return 0
             except Exception as exc:
                 print(time.strftime("%Y-%m-%d %H:%M:%S"), f"retry: {exc}", file=sys.stderr, flush=True)
                 delay = config.active_poll_seconds
+                changed_rollouts = None
+                changed_sources = None
+                next_quota_poll_at = time.monotonic() + _QUOTA_POLL_SECONDS
             try:
+                quota_wait = max(0.0, next_quota_poll_at - time.monotonic())
                 event_triggered = wait_for_refresh(
                     watcher,
-                    fallback_seconds=delay,
+                    fallback_seconds=min(delay, quota_wait),
                     coalesce_seconds=config.coalesce_seconds,
                 )
                 if event_triggered:
-                    refresh_live_quota = not CodexEventWatcher.only_database_sources(watcher.consume_sources())
+                    changes = watcher.consume_changes()
+                    changed_rollouts = None if "unknown" in changes.sources else changes.rollout_paths
+                    changed_sources = None if "unknown" in changes.sources else changes.sources
+                    refresh_live_quota = False
                 else:
-                    refresh_live_quota = True
+                    refresh_live_quota = time.monotonic() >= next_quota_poll_at
             except KeyboardInterrupt:
                 return 0
 

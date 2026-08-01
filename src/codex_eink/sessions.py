@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import sqlite3
 import dataclasses
@@ -14,6 +15,8 @@ from .models import ProjectState, ProjectStatus
 
 _SPACE = re.compile(r"\s+")
 _PLAN_STATUS = re.compile(r"(?:[\"']status[\"']|status)\s*:\s*[\"'](completed|in_progress|pending)[\"']")
+_MAX_TEXT_SCAN_CHARS = 4096
+_MAX_TITLE_SCAN_CHARS = 1024
 
 
 def _epoch(value: str | None, fallback: float = 0.0) -> float:
@@ -28,6 +31,7 @@ def _epoch(value: str | None, fallback: float = 0.0) -> float:
 def _clean_text(value: object, limit: int = 240) -> str:
     if not isinstance(value, str):
         return ""
+    value = value[: max(limit, _MAX_TEXT_SCAN_CHARS)]
     value = "".join(ch if ch >= " " else " " for ch in value)
     return _SPACE.sub(" ", value).strip()[:limit]
 
@@ -72,13 +76,116 @@ def load_state_titles(path: str | Path) -> dict[str, str]:
         connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=1)
         try:
             rows = connection.execute(
-                "SELECT id, title FROM threads WHERE title <> '' AND COALESCE(thread_source, 'user') <> 'subagent'"
+                "SELECT id, substr(title, 1, ?) FROM threads "
+                "WHERE title <> '' AND COALESCE(thread_source, 'user') <> 'subagent'",
+                (_MAX_TITLE_SCAN_CHARS,),
             ).fetchall()
         finally:
             connection.close()
     except sqlite3.Error:
         return {}
     return {str(session_id): _clean_text(title) for session_id, title in rows if _clean_text(title)}
+
+
+def _state_title_cursor(path: str | Path) -> int:
+    path = Path(path)
+    if not path.exists():
+        return 0
+    try:
+        connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=1)
+        try:
+            row = connection.execute(
+                "SELECT COALESCE(MAX(COALESCE(updated_at_ms, updated_at * 1000)), 0) FROM threads"
+            ).fetchone()
+        finally:
+            connection.close()
+    except sqlite3.Error:
+        return 0
+    return int(row[0] or 0) if row else 0
+
+
+def _load_state_title_updates(path: str | Path, since_ms: int) -> tuple[dict[str, str | None], int] | None:
+    path = Path(path)
+    if not path.exists():
+        return {}, since_ms
+    try:
+        connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=1)
+        try:
+            rows = connection.execute(
+                "SELECT id, substr(title, 1, ?), COALESCE(thread_source, 'user'), "
+                "COALESCE(updated_at_ms, updated_at * 1000, 0) FROM threads "
+                "WHERE COALESCE(updated_at_ms, updated_at * 1000, 0) >= ?",
+                (_MAX_TITLE_SCAN_CHARS, since_ms),
+            ).fetchall()
+        finally:
+            connection.close()
+    except sqlite3.Error:
+        return None
+
+    updates: dict[str, str | None] = {}
+    cursor = since_ms
+    for session_id, title, thread_source, updated_at_ms in rows:
+        cursor = max(cursor, int(updated_at_ms or 0))
+        cleaned = _clean_text(title)
+        updates[str(session_id)] = cleaned if cleaned and str(thread_source).casefold() != "subagent" else None
+    return updates, cursor
+
+
+class TitleSnapshotCache:
+    """Cache thread titles and query only rows changed since the last state event."""
+
+    def __init__(
+        self,
+        codex_home: str | Path,
+        *,
+        reconcile_seconds: float = 300.0,
+        clock=time.monotonic,
+    ) -> None:
+        self.codex_home = Path(codex_home)
+        self.reconcile_seconds = reconcile_seconds
+        self._clock = clock
+        self._session_titles: dict[str, str] = {}
+        self._state_titles: dict[str, str] = {}
+        self._state_cursor_ms = 0
+        self._initialized = False
+        self._last_reconcile_at = 0.0
+
+    def collect(self, *, changed_sources: Iterable[str] | None = None) -> dict[str, str]:
+        now = self._clock()
+        sources = frozenset(changed_sources or ())
+        full_reconcile = (
+            not self._initialized
+            or changed_sources is None
+            or now - self._last_reconcile_at >= self.reconcile_seconds
+            or "unknown" in sources
+        )
+        state_path = self.codex_home / "state_5.sqlite"
+
+        if full_reconcile:
+            self._session_titles = load_session_titles(self.codex_home / "session_index.jsonl")
+            self._state_titles = load_state_titles(state_path)
+            self._state_cursor_ms = _state_title_cursor(state_path)
+            self._initialized = True
+            self._last_reconcile_at = now
+        else:
+            if "session_index" in sources:
+                self._session_titles = load_session_titles(self.codex_home / "session_index.jsonl")
+            if "state_db" in sources:
+                result = _load_state_title_updates(state_path, self._state_cursor_ms)
+                if result is None:
+                    self._state_titles = load_state_titles(state_path)
+                    self._state_cursor_ms = _state_title_cursor(state_path)
+                else:
+                    updates, self._state_cursor_ms = result
+                    for session_id, title in updates.items():
+                        if title is None:
+                            self._state_titles.pop(session_id, None)
+                        else:
+                            self._state_titles[session_id] = title
+
+        titles = dict(self._session_titles)
+        titles.update(self._state_titles)
+        return titles
 
 
 def load_unread_thread_ids(path: str | Path) -> set[str]:
@@ -356,3 +463,98 @@ def collect_projects(root: str | Path, titles: dict[str, str], max_files: int = 
             projects.append(project)
     projects.sort(key=lambda item: item.updated_at, reverse=True)
     return projects
+
+
+@dataclasses.dataclass(frozen=True)
+class _RolloutCacheEntry:
+    fingerprint: tuple[int, int]
+    project: ProjectState | None
+
+
+class SessionSnapshotCache:
+    """Keep parsed rollout state in memory and reparse only changed files."""
+
+    def __init__(
+        self,
+        root: str | Path,
+        *,
+        max_files: int = 120,
+        reconcile_seconds: float = 300.0,
+        clock=time.monotonic,
+    ) -> None:
+        self.root = Path(root)
+        self.max_files = max_files
+        self.reconcile_seconds = reconcile_seconds
+        self._clock = clock
+        self._entries: dict[str, _RolloutCacheEntry] = {}
+        self._initialized = False
+        self._last_reconcile_at = 0.0
+
+    @staticmethod
+    def _key(path: str | Path) -> str:
+        return os.path.normcase(os.path.abspath(path))
+
+    @staticmethod
+    def _fingerprint(path: Path) -> tuple[int, int] | None:
+        try:
+            stat = path.stat()
+        except OSError:
+            return None
+        return stat.st_mtime_ns, stat.st_size
+
+    @staticmethod
+    def _is_rollout(path: Path) -> bool:
+        return path.suffix.casefold() == ".jsonl" and path.name.casefold().startswith("rollout-")
+
+    def collect(
+        self,
+        titles: dict[str, str],
+        *,
+        changed_paths: Iterable[str | Path] | None = None,
+        force_reconcile: bool = False,
+    ) -> list[ProjectState]:
+        now = self._clock()
+        reconcile_due = self._initialized and now - self._last_reconcile_at >= self.reconcile_seconds
+        full_reconcile = not self._initialized or force_reconcile or changed_paths is None or reconcile_due
+
+        if full_reconcile:
+            targets = discover_rollouts(self.root, max_files=self.max_files)
+            live_keys = {self._key(path) for path in targets}
+            for key in tuple(self._entries):
+                if key not in live_keys:
+                    del self._entries[key]
+            self._initialized = True
+            self._last_reconcile_at = now
+        else:
+            targets = [Path(path) for path in changed_paths if self._is_rollout(Path(path))]
+
+        for path in targets:
+            key = self._key(path)
+            fingerprint = self._fingerprint(path)
+            if fingerprint is None:
+                self._entries.pop(key, None)
+                continue
+            cached = self._entries.get(key)
+            if cached is not None and cached.fingerprint == fingerprint:
+                continue
+            self._entries[key] = _RolloutCacheEntry(fingerprint, parse_rollout(path, titles))
+
+        if len(self._entries) > self.max_files:
+            newest = sorted(
+                self._entries.items(),
+                key=lambda item: item[1].fingerprint[0],
+                reverse=True,
+            )[: self.max_files]
+            self._entries = dict(newest)
+
+        projects = []
+        for entry in self._entries.values():
+            project = entry.project
+            if project is None:
+                continue
+            current_title = _display_title(titles.get(project.session_id, ""))
+            if project.title != current_title:
+                project = dataclasses.replace(project, title=current_title)
+            projects.append(project)
+        projects.sort(key=lambda item: item.updated_at, reverse=True)
+        return projects

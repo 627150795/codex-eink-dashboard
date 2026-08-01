@@ -102,13 +102,17 @@ class BleTransport:
             from bleak import BleakScanner
         except ImportError as exc:
             raise RuntimeError("Bleak is not installed; run install.ps1 first") from exc
-        devices = await BleakScanner.discover(timeout=self.scan_timeout)
-        for device in devices:
-            name = device.name or ""
-            if self.address and str(device.address).lower() == self.address.lower():
-                return device
-            if not self.address and name.startswith(self.name_prefix):
-                return device
+        if self.address:
+            device = await BleakScanner.find_device_by_address(self.address, timeout=self.scan_timeout)
+        else:
+            device = await BleakScanner.find_device_by_filter(
+                lambda device, advertisement_data: (
+                    device.name or advertisement_data.local_name or ""
+                ).startswith(self.name_prefix),
+                timeout=self.scan_timeout,
+            )
+        if device is not None:
+            return device
         target = self.address or f"name prefix {self.name_prefix!r}"
         raise TimeoutError(f"e-ink device not found ({target}); wait for its advertising window or press its button")
 
@@ -119,10 +123,13 @@ class BleTransport:
         except ImportError as exc:
             raise RuntimeError("Bleak is not installed; run install.ps1 first") from exc
 
+        # Discovery failures should return to the outer scheduler instead of
+        # multiplying the full scan timeout. Connection/GATT retries reuse the
+        # discovered device for this one upload attempt.
+        device = await self._find_device()
         last_error: Exception | None = None
         for attempt in range(retries + 1):
             try:
-                device = await self._find_device()
                 async with BleakClient(device) as client:
                     return await callback(client)
             except asyncio.CancelledError:

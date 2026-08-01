@@ -30,6 +30,19 @@ class CodexEventWatcherTests(unittest.TestCase):
         self.assertTrue(CodexEventWatcher.only_database_sources(sources))
         self.assertFalse(CodexEventWatcher.only_database_sources(frozenset()))
 
+    def test_rollout_changes_keep_exact_paths_and_revision(self):
+        path = self.root / "sessions" / "2026" / "07" / "rollout-a.jsonl"
+        self.watcher.signal(path)
+        self.watcher.signal(path)
+
+        changes = self.watcher.consume_changes()
+
+        self.assertEqual(changes.sources, frozenset({"rollout"}))
+        self.assertEqual(changes.rollout_paths, frozenset({path}))
+        self.assertEqual(changes.revision, 2)
+        self.assertEqual(self.watcher.revision, 2)
+        self.assertEqual(self.watcher.consume_changes().rollout_paths, frozenset())
+
     def test_burst_signal_extends_the_quiet_period(self):
         clock = [100.0]
         watcher = CodexEventWatcher(self.root, clock=lambda: clock[0])
@@ -47,7 +60,6 @@ class CodexEventWatcherTests(unittest.TestCase):
         self.assertFalse(self.watcher.wait(0))
         self.watcher.signal()
         self.assertTrue(self.watcher.wait(0))
-
 
 if __name__ == "__main__":
     unittest.main()

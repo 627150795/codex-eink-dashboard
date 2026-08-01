@@ -4,6 +4,7 @@ import os
 import threading
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 
 from watchdog.events import FileSystemEvent, FileSystemEventHandler
@@ -22,6 +23,13 @@ _DATABASE_SOURCES = {
     "logs_2.sqlite-wal": "activity_db",
     "logs_2.sqlite-shm": "activity_db",
 }
+
+
+@dataclass(frozen=True)
+class CodexChanges:
+    sources: frozenset[str]
+    rollout_paths: frozenset[Path]
+    revision: int
 
 
 class _CodexChangeHandler(FileSystemEventHandler):
@@ -51,6 +59,8 @@ class CodexEventWatcher:
         self._lock = threading.Lock()
         self._last_signal_at: float | None = None
         self._pending_sources: set[str] = set()
+        self._pending_rollout_paths: set[Path] = set()
+        self._revision = 0
         self._observer: Observer | None = None
 
     def is_relevant_path(self, path: str | Path) -> bool:
@@ -93,13 +103,26 @@ class CodexEventWatcher:
             self._last_signal_at = self._clock()
             source = self.source_for_path(path) if path is not None else None
             self._pending_sources.add(source or "unknown")
+            if source == "rollout" and path is not None:
+                self._pending_rollout_paths.add(Path(os.path.abspath(path)))
+            self._revision += 1
             self._event.set()
 
     def consume_sources(self) -> frozenset[str]:
+        return self.consume_changes().sources
+
+    def consume_changes(self) -> CodexChanges:
         with self._lock:
             sources = frozenset(self._pending_sources)
+            rollout_paths = frozenset(self._pending_rollout_paths)
             self._pending_sources.clear()
-            return sources
+            self._pending_rollout_paths.clear()
+            return CodexChanges(sources, rollout_paths, self._revision)
+
+    @property
+    def revision(self) -> int:
+        with self._lock:
+            return self._revision
 
     @staticmethod
     def only_database_sources(sources: frozenset[str]) -> bool:

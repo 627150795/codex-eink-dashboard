@@ -1,10 +1,22 @@
 import json
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
+import codex_eink.sessions as sessions_module
 from codex_eink.models import ProjectStatus
-from codex_eink.sessions import collect_projects, load_session_titles, load_unread_thread_ids, parse_rollout, reconcile_live_activity
+from codex_eink.sessions import (
+    SessionSnapshotCache,
+    TitleSnapshotCache,
+    collect_projects,
+    load_session_titles,
+    load_state_titles,
+    load_unread_thread_ids,
+    parse_rollout,
+    reconcile_live_activity,
+)
 
 
 def row(timestamp, row_type, payload):
@@ -20,6 +32,111 @@ def write_rollout(path: Path, rows):
 
 
 class SessionCollectorTests(unittest.TestCase):
+    def test_state_titles_bound_pathological_title_length(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "state.sqlite"
+            connection = sqlite3.connect(path)
+            connection.execute("CREATE TABLE threads (id TEXT, title TEXT, thread_source TEXT)")
+            connection.execute(
+                "INSERT INTO threads VALUES (?, ?, ?)",
+                ("long", "useful title " + "x" * 200_000, "user"),
+            )
+            connection.commit()
+            connection.close()
+
+            titles = load_state_titles(path)
+
+        self.assertTrue(titles["long"].startswith("useful title "))
+        self.assertEqual(len(titles["long"]), 240)
+
+    def test_title_cache_skips_rollout_events_and_reads_incremental_state_updates(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            (root / "session_index.jsonl").write_text(
+                json.dumps({"id": "thread", "thread_name": "Index title", "updated_at": "2026-01-01T00:00:00Z"}),
+                encoding="utf-8",
+            )
+            state_path = root / "state_5.sqlite"
+            connection = sqlite3.connect(state_path)
+            connection.execute(
+                "CREATE TABLE threads (id TEXT, title TEXT, thread_source TEXT, updated_at INTEGER, updated_at_ms INTEGER)"
+            )
+            connection.execute("INSERT INTO threads VALUES (?, ?, ?, ?, ?)", ("thread", "State title", "user", 1, 1000))
+            connection.commit()
+            connection.close()
+            cache = TitleSnapshotCache(root)
+
+            self.assertEqual(cache.collect()["thread"], "State title")
+            with patch(
+                "codex_eink.sessions._load_state_title_updates",
+                wraps=sessions_module._load_state_title_updates,
+            ) as updates:
+                self.assertEqual(cache.collect(changed_sources={"rollout"})["thread"], "State title")
+                updates.assert_not_called()
+
+                connection = sqlite3.connect(state_path)
+                connection.execute("UPDATE threads SET title = ?, updated_at_ms = ? WHERE id = ?", ("New title", 2000, "thread"))
+                connection.commit()
+                connection.close()
+                self.assertEqual(cache.collect(changed_sources={"state_db"})["thread"], "New title")
+                updates.assert_called_once()
+
+                connection = sqlite3.connect(state_path)
+                connection.execute("UPDATE threads SET title = '', updated_at_ms = 3000 WHERE id = 'thread'")
+                connection.commit()
+                connection.close()
+                self.assertEqual(cache.collect(changed_sources={"state_db"})["thread"], "Index title")
+
+    def test_snapshot_cache_reparses_only_changed_rollout(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder) / "sessions"
+            path = root / "rollout-cached.jsonl"
+            rows = [
+                row("2026-07-20T00:00:00Z", "session_meta", {"id": "cached", "thread_source": "user"}),
+                row("2026-07-20T00:00:01Z", "event_msg", {"type": "task_started", "turn_id": "turn-1"}),
+            ]
+            write_rollout(path, rows)
+            cache = SessionSnapshotCache(root)
+
+            with patch("codex_eink.sessions.parse_rollout", wraps=parse_rollout) as parse:
+                first = cache.collect({"cached": "Old title"})
+                unchanged = cache.collect({"cached": "New title"}, changed_paths=[])
+                write_rollout(
+                    path,
+                    rows + [row("2026-07-20T00:00:02Z", "event_msg", {"type": "task_complete", "turn_id": "turn-1"})],
+                )
+                changed = cache.collect({"cached": "New title"}, changed_paths=[path])
+
+            self.assertEqual(parse.call_count, 2)
+            self.assertEqual(first[0].status, ProjectStatus.ACTIVE)
+            self.assertEqual(unchanged[0].title, "New title")
+            self.assertEqual(changed[0].status, ProjectStatus.DONE)
+
+    def test_snapshot_cache_periodically_reconciles_missed_files(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder) / "sessions"
+            first_path = root / "rollout-first.jsonl"
+            second_path = root / "rollout-second.jsonl"
+            write_rollout(
+                first_path,
+                [row("2026-07-20T00:00:00Z", "session_meta", {"id": "first", "thread_source": "user"})],
+            )
+            clock = [0.0]
+            cache = SessionSnapshotCache(root, reconcile_seconds=300, clock=lambda: clock[0])
+            self.assertEqual([item.session_id for item in cache.collect({})], ["first"])
+
+            write_rollout(
+                second_path,
+                [row("2026-07-20T00:00:01Z", "session_meta", {"id": "second", "thread_source": "user"})],
+            )
+            clock[0] = 299.0
+            self.assertEqual([item.session_id for item in cache.collect({}, changed_paths=[])], ["first"])
+            clock[0] = 301.0
+            self.assertEqual(
+                {item.session_id for item in cache.collect({}, changed_paths=[])},
+                {"first", "second"},
+            )
+
     def test_latest_started_turn_without_terminal_is_active(self):
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / "rollout-active.jsonl"
