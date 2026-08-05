@@ -6,6 +6,7 @@ import re
 import sqlite3
 import dataclasses
 import time
+from collections.abc import Mapping
 from datetime import datetime
 from pathlib import Path
 from typing import Iterable
@@ -205,7 +206,12 @@ def load_unread_thread_ids(path: str | Path) -> set[str]:
     return {item for item in local if isinstance(item, str)}
 
 
-def load_recent_thread_ids(path: str | Path, *, now: float | None = None, grace_seconds: int = 600) -> set[str] | None:
+def load_recent_thread_activity(
+    path: str | Path,
+    *,
+    now: float | None = None,
+    grace_seconds: int = 600,
+) -> dict[str, float] | None:
     path = Path(path)
     if not path.exists():
         return None
@@ -214,28 +220,45 @@ def load_recent_thread_ids(path: str | Path, *, now: float | None = None, grace_
         connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=1)
         try:
             rows = connection.execute(
-                "SELECT DISTINCT thread_id FROM logs WHERE thread_id IS NOT NULL AND ts >= ?",
+                "SELECT thread_id, MAX(ts) FROM logs "
+                "WHERE thread_id IS NOT NULL AND ts >= ? GROUP BY thread_id",
                 (cutoff,),
             ).fetchall()
         finally:
             connection.close()
     except sqlite3.Error:
         return None
-    return {str(row[0]) for row in rows if row[0]}
+    return {str(row[0]): float(row[1]) for row in rows if row[0] and row[1] is not None}
+
+
+def load_recent_thread_ids(path: str | Path, *, now: float | None = None, grace_seconds: int = 600) -> set[str] | None:
+    activity = load_recent_thread_activity(path, now=now, grace_seconds=grace_seconds)
+    return None if activity is None else set(activity)
 
 
 def reconcile_live_activity(
     projects: list[ProjectState],
-    live_thread_ids: set[str] | None,
+    live_thread_ids: Mapping[str, float] | set[str] | None,
     *,
     now: float,
     grace_seconds: int = 600,
 ) -> list[ProjectState]:
     if live_thread_ids is None:
         return projects
+    activity_times = live_thread_ids if isinstance(live_thread_ids, Mapping) else None
+    live_ids = set(live_thread_ids)
     output = []
     for project in projects:
-        if project.status == ProjectStatus.DONE and project.terminal_source == "final_answer" and project.session_id in live_thread_ids:
+        activity_after_terminal = (
+            activity_times is None
+            or activity_times.get(project.session_id, float("-inf")) > project.updated_at
+        )
+        if (
+            project.status == ProjectStatus.DONE
+            and project.terminal_source == "final_answer"
+            and project.session_id in live_ids
+            and activity_after_terminal
+        ):
             output.append(
                 dataclasses.replace(
                     project,
@@ -247,7 +270,7 @@ def reconcile_live_activity(
             )
         elif (
             project.status == ProjectStatus.ACTIVE
-            and project.session_id not in live_thread_ids
+            and project.session_id not in live_ids
             and now - project.updated_at > grace_seconds
         ):
             output.append(dataclasses.replace(project, status=ProjectStatus.IDLE))

@@ -13,6 +13,7 @@ from codex_eink.sessions import (
     collect_projects,
     load_session_titles,
     load_state_titles,
+    load_recent_thread_activity,
     load_unread_thread_ids,
     parse_rollout,
     reconcile_live_activity,
@@ -32,6 +33,22 @@ def write_rollout(path: Path, rows):
 
 
 class SessionCollectorTests(unittest.TestCase):
+    def test_recent_thread_activity_keeps_latest_timestamp_per_thread(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "logs.sqlite"
+            connection = sqlite3.connect(path)
+            connection.execute("CREATE TABLE logs (thread_id TEXT, ts INTEGER)")
+            connection.executemany(
+                "INSERT INTO logs VALUES (?, ?)",
+                [("thread-a", 90), ("thread-a", 110), ("thread-b", 105), (None, 120)],
+            )
+            connection.commit()
+            connection.close()
+
+            activity = load_recent_thread_activity(path, now=120, grace_seconds=20)
+
+        self.assertEqual(activity, {"thread-a": 110.0, "thread-b": 105.0})
+
     def test_state_titles_bound_pathological_title_length(self):
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / "state.sqlite"
@@ -393,6 +410,38 @@ class SessionCollectorTests(unittest.TestCase):
             project = parse_rollout(path, {})
         reconciled = reconcile_live_activity([project], {"live"}, now=1784813300)
         self.assertEqual(reconciled[0].status, ProjectStatus.ACTIVE)
+
+    def test_stale_activity_does_not_reopen_final_answer(self):
+        from codex_eink.models import ProjectState
+
+        project = ProjectState(
+            "done",
+            "Done",
+            ProjectStatus.DONE,
+            100,
+            summary="finished",
+            terminal_id="turn-1",
+            terminal_source="final_answer",
+        )
+        reconciled = reconcile_live_activity([project], {"done": 99}, now=200)
+        self.assertEqual(reconciled[0].status, ProjectStatus.DONE)
+        self.assertEqual(reconciled[0].summary, "finished")
+
+    def test_newer_activity_reopens_final_answer(self):
+        from codex_eink.models import ProjectState
+
+        project = ProjectState(
+            "done",
+            "Done",
+            ProjectStatus.DONE,
+            100,
+            summary="finished",
+            terminal_id="turn-1",
+            terminal_source="final_answer",
+        )
+        reconciled = reconcile_live_activity([project], {"done": 101}, now=200)
+        self.assertEqual(reconciled[0].status, ProjectStatus.ACTIVE)
+        self.assertEqual(reconciled[0].summary, "")
 
     def test_live_thread_does_not_override_task_complete(self):
         with tempfile.TemporaryDirectory() as folder:

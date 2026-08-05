@@ -15,7 +15,7 @@ class AppConfig:
     resolution: tuple[int, int] | None = None
     active_poll_seconds: int = 30
     idle_poll_seconds: int = 60
-    coalesce_seconds: float = 0.3
+    coalesce_seconds: float = 1.0
     privacy_mode: str = "summary"
     account_mode: str = "auto"
     scan_timeout_seconds: float = 12.0

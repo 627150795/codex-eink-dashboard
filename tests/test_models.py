@@ -20,6 +20,7 @@ class ModelTests(unittest.TestCase):
         self.assertEqual(config.orientation, "landscape")
         self.assertEqual(config.active_poll_seconds, 30)
         self.assertEqual(config.idle_poll_seconds, 60)
+        self.assertEqual(config.coalesce_seconds, 1.0)
         self.assertEqual(config.ble_keepalive_seconds, 20)
         self.assertFalse(config.ble_always_connected)
         self.assertEqual(config.privacy_mode, "summary")

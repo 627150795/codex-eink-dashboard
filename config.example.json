@@ -4,7 +4,7 @@
   "resolution": null,
   "active_poll_seconds": 30,
   "idle_poll_seconds": 60,
-  "coalesce_seconds": 0.3,
+  "coalesce_seconds": 1.0,
   "privacy_mode": "summary",
   "account_mode": "auto",
   "scan_timeout_seconds": 12,

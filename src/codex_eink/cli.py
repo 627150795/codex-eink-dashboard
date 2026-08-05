@@ -22,7 +22,7 @@ from .reducer import reduce_dashboard
 from .render import render_dashboard
 from .logstats import default_log_path, filter_days, format_report, load_log, recent_day_bounds
 from .service import FrameCache, frame_digest, quantize_battery_voltage, quantize_sync_time, should_upload
-from .sessions import SessionSnapshotCache, TitleSnapshotCache, collect_projects, load_recent_thread_ids, load_session_titles, load_state_titles, load_unread_thread_ids, reconcile_live_activity
+from .sessions import SessionSnapshotCache, TitleSnapshotCache, collect_projects, load_recent_thread_activity, load_session_titles, load_state_titles, load_unread_thread_ids, reconcile_live_activity
 
 
 _LAST_SUCCESSFUL_LIVE_QUOTA: QuotaState | None = None
@@ -103,8 +103,8 @@ def collect_view(
     else:
         projects = project_cache.collect(titles, changed_paths=changed_rollouts)
     now = time.time()
-    live_ids = load_recent_thread_ids(codex_home / "logs_2.sqlite", now=now)
-    projects = reconcile_live_activity(projects, live_ids, now=now)
+    live_activity = load_recent_thread_activity(codex_home / "logs_2.sqlite", now=now)
+    projects = reconcile_live_activity(projects, live_activity, now=now)
     unread_ids = load_unread_thread_ids(codex_home / ".codex-global-state.json")
     projects = apply_terminal_notification_state(projects, unread_ids, now=now)
     if config.privacy_mode == "titles":
