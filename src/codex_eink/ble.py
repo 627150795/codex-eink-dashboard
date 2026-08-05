@@ -52,11 +52,66 @@ class BleTransport:
         address: str | None = None,
         scan_timeout: float = 12.0,
         status_timeout: float = 8.0,
+        keepalive_seconds: float | None = 0.0,
     ):
         self.name_prefix = name_prefix
         self.address = address
         self.scan_timeout = scan_timeout
         self.status_timeout = status_timeout
+        self.keepalive_seconds = None if keepalive_seconds is None else max(0.0, float(keepalive_seconds))
+        self._client = None
+        self._device = None
+        self._disconnect_task: asyncio.Task | None = None
+
+    @property
+    def connected_client(self):
+        client = self._client
+        return client if client is not None and bool(getattr(client, "is_connected", False)) else None
+
+    async def _cancel_disconnect_timer(self) -> None:
+        task = self._disconnect_task
+        self._disconnect_task = None
+        if task is None or task is asyncio.current_task():
+            return
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    async def _disconnect(self, *, clear_device: bool) -> None:
+        client = self._client
+        self._client = None
+        if clear_device:
+            self._device = None
+        if client is None:
+            return
+        try:
+            if bool(getattr(client, "is_connected", True)):
+                await client.disconnect()
+        except Exception:
+            pass
+
+    async def _disconnect_after_idle(self, client) -> None:
+        try:
+            if self.keepalive_seconds is None:
+                return
+            await asyncio.sleep(self.keepalive_seconds)
+            if self._client is client:
+                await self._disconnect(clear_device=True)
+        except asyncio.CancelledError:
+            return
+        finally:
+            if self._disconnect_task is asyncio.current_task():
+                self._disconnect_task = None
+
+    def _arm_disconnect_timer(self, client) -> None:
+        if self.keepalive_seconds is not None and self.keepalive_seconds > 0:
+            self._disconnect_task = asyncio.create_task(self._disconnect_after_idle(client))
+
+    async def close(self) -> None:
+        await self._cancel_disconnect_timer()
+        await self._disconnect(clear_device=True)
 
     async def _read_status(self, client) -> DeviceStatus:
         loop = asyncio.get_running_loop()
@@ -123,25 +178,62 @@ class BleTransport:
         except ImportError as exc:
             raise RuntimeError("Bleak is not installed; run install.ps1 first") from exc
 
-        # Discovery failures should return to the outer scheduler instead of
-        # multiplying the full scan timeout. Connection/GATT retries reuse the
-        # discovered device for this one upload attempt.
-        device = await self._find_device()
+        if self.keepalive_seconds == 0:
+            device = await self._find_device()
+            last_error: Exception | None = None
+            for attempt in range(retries + 1):
+                try:
+                    async with BleakClient(device) as client:
+                        return await callback(client)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    last_error = exc
+                    if attempt >= retries:
+                        raise
+                    await asyncio.sleep(min(2**attempt, 4))
+            assert last_error is not None
+            raise last_error
+
+        await self._cancel_disconnect_timer()
+        if self._device is None:
+            self._device = await self._find_device()
+
         last_error: Exception | None = None
         for attempt in range(retries + 1):
             try:
-                async with BleakClient(device) as client:
-                    return await callback(client)
+                client = self.connected_client
+                if client is None:
+                    await self._disconnect(clear_device=False)
+                    client = BleakClient(self._device)
+                    await client.connect()
+                    self._client = client
+                result = await callback(client)
+                self._arm_disconnect_timer(client)
+                return result
             except asyncio.CancelledError:
+                await self.close()
                 raise
             except Exception as exc:
                 # Bleak raises platform-specific errors for GATT Invalid PDU / disconnects.
                 last_error = exc
+                await self._disconnect(clear_device=False)
                 if attempt >= retries:
+                    self._device = None
                     raise
                 await asyncio.sleep(min(2**attempt, 4))
         assert last_error is not None
         raise last_error
+
+    async def ensure_connected(self) -> bool:
+        """Keep a persistent lease connected; return True when a new link was opened."""
+        was_connected = self.connected_client is not None
+
+        async def _noop(_client):
+            return None
+
+        await self.with_client(_noop, retries=1)
+        return not was_connected
 
     async def probe(self) -> DeviceStatus:
         async def _run(client):

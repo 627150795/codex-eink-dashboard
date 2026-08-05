@@ -170,6 +170,7 @@ class _WatcherStub:
 
 class RefreshSchedulingTests(unittest.TestCase):
     def test_event_refresh_uses_cached_quota_before_next_poll(self):
+        config = AppConfig(codex_home=Path("C:/codex-test"))
         watcher = MagicMock()
         watcher.__enter__.return_value = watcher
         watcher.__exit__.return_value = None
@@ -180,6 +181,8 @@ class RefreshSchedulingTests(unittest.TestCase):
             1,
         )
         calls = []
+        transport = MagicMock()
+        transport.close = AsyncMock()
 
         async def fake_once(_config, **kwargs):
             calls.append(kwargs)
@@ -189,8 +192,9 @@ class RefreshSchedulingTests(unittest.TestCase):
 
         args = SimpleNamespace(config=None, preview="previews/live.png")
         with (
-            patch("codex_eink.cli._config", return_value=AppConfig(codex_home=Path("C:/codex-test"))),
+            patch("codex_eink.cli._config", return_value=config),
             patch("codex_eink.cli.CodexEventWatcher", return_value=watcher),
+            patch("codex_eink.cli._transport", return_value=transport) as make_transport,
             patch("codex_eink.cli._once", side_effect=fake_once),
             patch("codex_eink.cli.collect_view", side_effect=AssertionError("duplicate collection")),
             patch("codex_eink.cli.wait_for_refresh", return_value=True),
@@ -201,6 +205,42 @@ class RefreshSchedulingTests(unittest.TestCase):
         self.assertEqual(calls[0]["use_quota_fallback"], True)
         self.assertEqual(calls[1]["live_quota"], False)
         self.assertEqual(calls[1]["use_quota_fallback"], False)
+        self.assertIs(calls[0]["transport"], transport)
+        self.assertIs(calls[1]["transport"], transport)
+        make_transport.assert_called_once_with(config, keepalive_seconds=20)
+        transport.close.assert_awaited_once()
+
+    def test_always_connected_mode_maintains_an_indefinite_transport(self):
+        config = AppConfig(codex_home=Path("C:/codex-test"), ble_always_connected=True)
+        watcher = MagicMock()
+        watcher.__enter__.return_value = watcher
+        watcher.__exit__.return_value = None
+        watcher.revision = 0
+        transport = MagicMock()
+        transport.ensure_connected = AsyncMock(return_value=True)
+        transport.close = AsyncMock()
+        calls = 0
+
+        async def fake_once(_config, **_kwargs):
+            nonlocal calls
+            calls += 1
+            if calls > 1:
+                raise KeyboardInterrupt
+            return UpdateOutcome("unchanged", None, False)
+
+        args = SimpleNamespace(config=None, preview="previews/live.png")
+        with (
+            patch("codex_eink.cli._config", return_value=config),
+            patch("codex_eink.cli.CodexEventWatcher", return_value=watcher),
+            patch("codex_eink.cli._transport", return_value=transport) as make_transport,
+            patch("codex_eink.cli._once", side_effect=fake_once),
+            patch("codex_eink.cli.wait_for_refresh", return_value=True),
+        ):
+            self.assertEqual(command_run(args), 0)
+
+        make_transport.assert_called_once_with(config, keepalive_seconds=None)
+        transport.ensure_connected.assert_awaited_once()
+        transport.close.assert_awaited_once()
 
     def test_stale_frame_is_dropped_before_ble_connect(self):
         with tempfile.TemporaryDirectory() as folder:

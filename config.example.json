@@ -9,6 +9,8 @@
   "account_mode": "auto",
   "scan_timeout_seconds": 12,
   "status_timeout_seconds": 8,
+  "ble_keepalive_seconds": 20,
+  "ble_always_connected": false,
   "image_index": 0,
   "orientation": "landscape"
 }

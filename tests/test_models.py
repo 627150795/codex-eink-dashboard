@@ -20,6 +20,8 @@ class ModelTests(unittest.TestCase):
         self.assertEqual(config.orientation, "landscape")
         self.assertEqual(config.active_poll_seconds, 30)
         self.assertEqual(config.idle_poll_seconds, 60)
+        self.assertEqual(config.ble_keepalive_seconds, 20)
+        self.assertFalse(config.ble_always_connected)
         self.assertEqual(config.privacy_mode, "summary")
 
     def test_config_loads_resolution_override(self):
@@ -41,6 +43,10 @@ class ModelTests(unittest.TestCase):
     def test_invalid_orientation_is_rejected(self):
         with self.assertRaises(ValueError):
             AppConfig(orientation="diagonal")
+
+    def test_negative_ble_keepalive_is_rejected(self):
+        with self.assertRaises(ValueError):
+            AppConfig(ble_keepalive_seconds=-1)
 
     def test_project_terminal_identity_is_stable(self):
         project = ProjectState(

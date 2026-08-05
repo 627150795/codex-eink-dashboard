@@ -135,12 +135,13 @@ def collect_view(
     return dataclasses.replace(view, synced_at=quantize_sync_time(now))
 
 
-def _transport(config: AppConfig) -> BleTransport:
+def _transport(config: AppConfig, *, keepalive_seconds: float | None = 0.0) -> BleTransport:
     return BleTransport(
         name_prefix=config.device_name_prefix,
         address=config.device_address,
         scan_timeout=config.scan_timeout_seconds,
         status_timeout=config.status_timeout_seconds,
+        keepalive_seconds=keepalive_seconds,
     )
 
 
@@ -212,6 +213,7 @@ async def _once(
     title_cache: TitleSnapshotCache | None = None,
     changed_sources: Iterable[str] | None = None,
     is_stale: Callable[[], bool] | None = None,
+    transport: BleTransport | None = None,
 ) -> UpdateOutcome:
     """Content-first update path.
 
@@ -220,7 +222,7 @@ async def _once(
     3. Only when upload is needed, open one BLE session: read status, re-render
        with live quantized voltage, write packets on the same connection.
     """
-    transport = _transport(config)
+    active_transport = transport or _transport(config)
     cache = FrameCache(preview_path.parent / ".state.json")
     cached = cache.load()
     resolution = _cached_resolution(config, cached)
@@ -243,7 +245,7 @@ async def _once(
     # Bootstrap: resolution unknown — must probe once, then continue content-first.
     if resolution is None:
         async def bootstrap_session(client):
-            status = await transport._read_status(client)
+            status = await active_transport._read_status(client)
             live_resolution = status.resolution
             if config.resolution is not None and config.resolution != live_resolution:
                 raise ValueError(f"configured resolution {config.resolution} does not match device {live_resolution}")
@@ -264,7 +266,7 @@ async def _once(
             if not force and stale():
                 return UpdateOutcome("superseded", status, bool(view.active_projects))
             packets = _build_packets(config, image, status, live_resolution)
-            await transport.write_packets(client, packets, expected_resolution=live_resolution, status=status)
+            await active_transport.write_packets(client, packets, expected_resolution=live_resolution, status=status)
             image.save(preview_path, format="PNG", optimize=False)
             cache.save(
                 digest=digest,
@@ -274,7 +276,7 @@ async def _once(
             )
             return UpdateOutcome(f"uploaded {len(packets)} packets", status, bool(view.active_projects))
 
-        return await transport.with_client(bootstrap_session, retries=2)
+        return await active_transport.with_client(bootstrap_session, retries=2)
 
     # Normal path: decide from local content first.
     view = dataclasses.replace(
@@ -291,7 +293,7 @@ async def _once(
         return UpdateOutcome("superseded", None, bool(view.active_projects))
 
     async def session(client):
-        status = await transport._read_status(client)
+        status = await active_transport._read_status(client)
         if status.resolution != resolution:
             raise ValueError(f"device resolution {status.resolution} does not match frame {resolution}")
         live_battery = quantize_battery_voltage(status.voltage, battery_display)
@@ -312,7 +314,7 @@ async def _once(
             return UpdateOutcome("superseded", status, bool(live_view.active_projects))
 
         packets = _build_packets(config, live_image, status, resolution)
-        await transport.write_packets(client, packets, expected_resolution=resolution, status=status)
+        await active_transport.write_packets(client, packets, expected_resolution=resolution, status=status)
         live_image.save(preview_path, format="PNG", optimize=False)
         cache.save(
             digest=live_digest,
@@ -322,7 +324,7 @@ async def _once(
         )
         return UpdateOutcome(f"uploaded {len(packets)} packets", status, bool(live_view.active_projects))
 
-    return await transport.with_client(session, retries=2)
+    return await active_transport.with_client(session, retries=2)
 
 
 def command_once(args) -> int:
@@ -341,9 +343,7 @@ def wait_for_refresh(watcher, *, fallback_seconds: float, coalesce_seconds: floa
     return True
 
 
-def command_run(args) -> int:
-    config = _config(args.config)
-    preview = Path(args.preview)
+async def _run_monitor(config: AppConfig, preview: Path, watcher: CodexEventWatcher) -> int:
     assert config.codex_home is not None
     refresh_live_quota = True
     next_quota_poll_at = time.monotonic()
@@ -351,27 +351,31 @@ def command_run(args) -> int:
     title_cache = TitleSnapshotCache(config.codex_home)
     changed_rollouts: Iterable[str | Path] | None = None
     changed_sources: Iterable[str] | None = None
-    with CodexEventWatcher(config.codex_home) as watcher:
+    keepalive_seconds = None if config.ble_always_connected else config.ble_keepalive_seconds
+    transport = _transport(config, keepalive_seconds=keepalive_seconds)
+    try:
         while True:
             try:
                 revision = watcher.revision
-                outcome = asyncio.run(
-                    _once(
-                        config,
-                        force=False,
-                        preview_path=preview,
-                        live_quota=refresh_live_quota,
-                        use_quota_fallback=refresh_live_quota,
-                        project_cache=project_cache,
-                        changed_rollouts=changed_rollouts,
-                        title_cache=title_cache,
-                        changed_sources=changed_sources,
-                        is_stale=lambda expected=revision: watcher.revision != expected,
-                    )
+                outcome = await _once(
+                    config,
+                    force=False,
+                    preview_path=preview,
+                    live_quota=refresh_live_quota,
+                    use_quota_fallback=refresh_live_quota,
+                    project_cache=project_cache,
+                    changed_rollouts=changed_rollouts,
+                    title_cache=title_cache,
+                    changed_sources=changed_sources,
+                    is_stale=lambda expected=revision: watcher.revision != expected,
+                    transport=transport,
                 )
                 changed_rollouts = frozenset()
                 changed_sources = frozenset()
                 print(time.strftime("%Y-%m-%d %H:%M:%S"), outcome.message, flush=True)
+                if config.ble_always_connected and outcome.message != "superseded":
+                    if await transport.ensure_connected():
+                        print(time.strftime("%Y-%m-%d %H:%M:%S"), "BLE always-on connected", flush=True)
                 delay = config.active_poll_seconds if outcome.has_active_projects else config.idle_poll_seconds
                 if refresh_live_quota:
                     next_quota_poll_at = time.monotonic() + _QUOTA_POLL_SECONDS
@@ -385,7 +389,8 @@ def command_run(args) -> int:
                 next_quota_poll_at = time.monotonic() + _QUOTA_POLL_SECONDS
             try:
                 quota_wait = max(0.0, next_quota_poll_at - time.monotonic())
-                event_triggered = wait_for_refresh(
+                event_triggered = await asyncio.to_thread(
+                    wait_for_refresh,
                     watcher,
                     fallback_seconds=min(delay, quota_wait),
                     coalesce_seconds=config.coalesce_seconds,
@@ -399,6 +404,19 @@ def command_run(args) -> int:
                     refresh_live_quota = time.monotonic() >= next_quota_poll_at
             except KeyboardInterrupt:
                 return 0
+    finally:
+        await transport.close()
+
+
+def command_run(args) -> int:
+    config = _config(args.config)
+    preview = Path(args.preview)
+    assert config.codex_home is not None
+    with CodexEventWatcher(config.codex_home) as watcher:
+        try:
+            return asyncio.run(_run_monitor(config, preview, watcher))
+        except KeyboardInterrupt:
+            return 0
 
 
 def command_stats(args) -> int:

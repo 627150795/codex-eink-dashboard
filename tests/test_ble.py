@@ -151,6 +151,109 @@ class BleTests(unittest.IsolatedAsyncioTestCase):
 
         transport._find_device.assert_awaited_once()
 
+    async def test_keepalive_reuses_connection_until_transport_is_closed(self):
+        device = types.SimpleNamespace(address="AA:BB", name="SKD-CLOCK")
+        scanner = Mock()
+        scanner.find_device_by_filter = AsyncMock(return_value=device)
+
+        class LeaseClient:
+            instances = []
+
+            def __init__(self, connected_device):
+                self.device = connected_device
+                self.is_connected = False
+                self.connect_count = 0
+                self.disconnect_count = 0
+                self.instances.append(self)
+
+            async def connect(self):
+                self.connect_count += 1
+                self.is_connected = True
+
+            async def disconnect(self):
+                self.disconnect_count += 1
+                self.is_connected = False
+
+        transport = BleTransport(keepalive_seconds=20)
+
+        async def identity(client):
+            return client
+
+        with self._fake_bleak(scanner, LeaseClient):
+            first = await transport.with_client(identity)
+            second = await transport.with_client(identity)
+            self.assertIs(first, second)
+            self.assertEqual(scanner.find_device_by_filter.await_count, 1)
+            self.assertEqual(len(LeaseClient.instances), 1)
+            self.assertEqual(LeaseClient.instances[0].connect_count, 1)
+            self.assertEqual(LeaseClient.instances[0].disconnect_count, 0)
+            await transport.close()
+
+        self.assertEqual(LeaseClient.instances[0].disconnect_count, 1)
+
+    async def test_keepalive_disconnects_automatically_after_idle_timeout(self):
+        device = types.SimpleNamespace(address="AA:BB", name="SKD-CLOCK")
+        scanner = Mock()
+        scanner.find_device_by_filter = AsyncMock(return_value=device)
+        disconnected = asyncio.Event()
+
+        class LeaseClient:
+            def __init__(self, _device):
+                self.is_connected = False
+
+            async def connect(self):
+                self.is_connected = True
+
+            async def disconnect(self):
+                self.is_connected = False
+                disconnected.set()
+
+        transport = BleTransport(keepalive_seconds=0.01)
+
+        with self._fake_bleak(scanner, LeaseClient):
+            await transport.with_client(AsyncMock(return_value="ok"))
+            await asyncio.wait_for(disconnected.wait(), timeout=1)
+
+        self.assertIsNone(transport.connected_client)
+
+    async def test_indefinite_keepalive_stays_connected_until_closed(self):
+        device = types.SimpleNamespace(address="AA:BB", name="SKD-CLOCK")
+        scanner = Mock()
+        scanner.find_device_by_filter = AsyncMock(return_value=device)
+
+        class LeaseClient:
+            instances = []
+
+            def __init__(self, _device):
+                self.is_connected = False
+                self.disconnect_count = 0
+                self.instances.append(self)
+
+            async def connect(self):
+                self.is_connected = True
+
+            async def disconnect(self):
+                self.disconnect_count += 1
+                self.is_connected = False
+
+        transport = BleTransport(keepalive_seconds=None)
+
+        with self._fake_bleak(scanner, LeaseClient):
+            self.assertTrue(await transport.ensure_connected())
+            client = transport.connected_client
+            self.assertFalse(await transport.ensure_connected())
+            await asyncio.sleep(0.02)
+            self.assertIs(transport.connected_client, client)
+            client.is_connected = False
+            self.assertTrue(await transport.ensure_connected())
+            replacement = transport.connected_client
+            self.assertIsNot(replacement, client)
+            await transport.close()
+
+        self.assertEqual(client.disconnect_count, 0)
+        self.assertEqual(replacement.disconnect_count, 1)
+        self.assertIsNone(transport.connected_client)
+
 
 if __name__ == "__main__":
     unittest.main()

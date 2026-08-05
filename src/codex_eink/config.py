@@ -20,6 +20,8 @@ class AppConfig:
     account_mode: str = "auto"
     scan_timeout_seconds: float = 12.0
     status_timeout_seconds: float = 8.0
+    ble_keepalive_seconds: float = 20.0
+    ble_always_connected: bool = False
     image_index: int = 0
     orientation: str = "landscape"
     codex_home: Path | None = None
@@ -42,6 +44,8 @@ class AppConfig:
             raise ValueError("poll intervals are too aggressive for an e-ink display")
         if self.coalesce_seconds <= 0:
             raise ValueError("coalesce_seconds must be greater than zero")
+        if self.ble_keepalive_seconds < 0:
+            raise ValueError("ble_keepalive_seconds must be zero or greater")
         if self.codex_home is None:
             root = os.environ.get("CODEX_HOME")
             object.__setattr__(self, "codex_home", Path(root) if root else Path.home() / ".codex")
