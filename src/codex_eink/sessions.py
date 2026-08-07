@@ -408,7 +408,9 @@ def parse_rollout(path: str | Path, titles: dict[str, str]) -> ProjectState | No
             last_start = index
             turn_id = str(payload.get("turn_id") or "")
 
+    # Codex can emit final_answer before trailing activity and task_complete.
     terminal: tuple[int, ProjectStatus, str, str, str] | None = None
+    terminal_is_provisional = False
     progress_current: int | None = None
     progress_total: int | None = None
     for index, row in enumerate(rows):
@@ -417,10 +419,16 @@ def parse_rollout(path: str | Path, titles: dict[str, str]) -> ProjectState | No
         payload = row.get("payload") or {}
         payload_type = str(payload.get("type") or "")
         if row.get("type") == "response_item" and payload_type == "function_call" and payload.get("name") == "update_plan":
+            if terminal_is_provisional:
+                terminal = None
+                terminal_is_provisional = False
             progress = _plan_progress(payload, turn_id)
             if progress is not None:
                 progress_current, progress_total = progress
         elif row.get("type") == "response_item" and payload_type == "custom_tool_call" and payload.get("name") == "exec":
+            if terminal_is_provisional:
+                terminal = None
+                terminal_is_provisional = False
             progress = _custom_plan_progress(payload, turn_id)
             if progress is not None:
                 progress_current, progress_total = progress
@@ -428,14 +436,17 @@ def parse_rollout(path: str | Path, titles: dict[str, str]) -> ProjectState | No
             metadata = payload.get("internal_chat_message_metadata_passthrough") or {}
             terminal_turn = str(metadata.get("turn_id") or turn_id)
             terminal = (index, ProjectStatus.DONE, terminal_turn, _summary_text(payload.get("content")), "final_answer")
+            terminal_is_provisional = True
         elif row.get("type") == "event_msg" and payload_type == "turn_aborted":
             terminal = (index, ProjectStatus.STOPPED, str(payload.get("turn_id") or turn_id), _clean_text(payload.get("reason")), "turn_aborted")
+            terminal_is_provisional = False
         elif row.get("type") == "event_msg" and payload_type == "task_complete":
             error = payload.get("error")
             message = error.get("message") if isinstance(error, dict) else error
             status = ProjectStatus.ERROR if error else ProjectStatus.DONE
             summary = _clean_text(message or payload.get("last_agent_message"))
             terminal = (index, status, str(payload.get("turn_id") or turn_id), summary, "task_complete")
+            terminal_is_provisional = False
         elif payload_type in {"task_failed", "turn_failed", "stream_error", "system_error"} or row.get("type") == "error":
             terminal = (
                 index,
@@ -444,6 +455,10 @@ def parse_rollout(path: str | Path, titles: dict[str, str]) -> ProjectState | No
                 _clean_text(payload.get("message") or payload.get("error")),
                 "error",
             )
+            terminal_is_provisional = False
+        elif terminal_is_provisional:
+            terminal = None
+            terminal_is_provisional = False
 
     if last_start < 0:
         status = terminal[1] if terminal else ProjectStatus.IDLE

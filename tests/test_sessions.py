@@ -186,6 +186,59 @@ class SessionCollectorTests(unittest.TestCase):
         self.assertEqual(project.summary, "已经完成并通过 12 项测试。")
         self.assertEqual(project.terminal_id, "t2")
 
+    def test_final_answer_followed_by_activity_is_still_active(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "rollout-provisional-final.jsonl"
+            write_rollout(
+                path,
+                [
+                    row("2026-07-20T00:00:00Z", "session_meta", {"id": "s-provisional", "thread_source": "user"}),
+                    row("2026-07-20T00:00:01Z", "event_msg", {"type": "task_started", "turn_id": "t-provisional"}),
+                    row(
+                        "2026-07-20T00:00:05Z",
+                        "response_item",
+                        {
+                            "type": "message",
+                            "role": "assistant",
+                            "phase": "final_answer",
+                            "internal_chat_message_metadata_passthrough": {"turn_id": "t-provisional"},
+                            "content": [{"type": "output_text", "text": "provisional"}],
+                        },
+                    ),
+                    row("2026-07-20T00:00:06Z", "event_msg", {"type": "agent_reasoning"}),
+                ],
+            )
+            project = parse_rollout(path, {})
+        self.assertEqual(project.status, ProjectStatus.ACTIVE)
+        self.assertEqual(project.terminal_source, "")
+
+    def test_task_complete_after_final_answer_remains_done(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "rollout-complete-after-final.jsonl"
+            write_rollout(
+                path,
+                [
+                    row("2026-07-20T00:00:00Z", "session_meta", {"id": "s-complete", "thread_source": "user"}),
+                    row("2026-07-20T00:00:01Z", "event_msg", {"type": "task_started", "turn_id": "t-complete"}),
+                    row(
+                        "2026-07-20T00:00:05Z",
+                        "response_item",
+                        {
+                            "type": "message",
+                            "role": "assistant",
+                            "phase": "final_answer",
+                            "internal_chat_message_metadata_passthrough": {"turn_id": "t-complete"},
+                            "content": [{"type": "output_text", "text": "complete"}],
+                        },
+                    ),
+                    row("2026-07-20T00:00:06Z", "event_msg", {"type": "token_count"}),
+                    row("2026-07-20T00:00:07Z", "event_msg", {"type": "task_complete", "turn_id": "t-complete"}),
+                ],
+            )
+            project = parse_rollout(path, {})
+        self.assertEqual(project.status, ProjectStatus.DONE)
+        self.assertEqual(project.terminal_source, "task_complete")
+
     def test_newer_start_supersedes_older_final_answer(self):
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / "rollout-multi.jsonl"
