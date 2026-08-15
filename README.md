@@ -1,4 +1,4 @@
-# Codex 无线墨水屏额度监控
+# Codex 无线墨水屏任务监控
 
 **中文** | [English](README_EN.md)
 
