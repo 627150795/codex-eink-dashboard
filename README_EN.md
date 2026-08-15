@@ -22,7 +22,16 @@ It is meant for anyone who wants a simple, inexpensive desk display for Codex in
 - up to 8 bottom status slots, arranged as 4 on the top row and 4 on the bottom row;
 - quick refresh triggers after task changes and automatic quota updates; the visible screen may still lag by a few seconds.
 
-Based on the author's purchase experience, similar devices on Pinduoduo can cost about RMB 15 after coupons. In low-frequency use, one charge has lasted more than two months in testing. Price and battery life vary with promotions, battery capacity, refresh frequency, and hardware batch. For this kind of low-cost setup, it may be one of the cheapest Codex quota monitor solutions currently available.
+Based on the author's purchase experience, similar devices on Pinduoduo can cost about RMB 15 after coupons. With the current low-power update strategy, battery life is expected to remain around three months. Price and battery life vary with promotions, battery capacity, refresh frequency, and hardware batch. For this kind of low-cost setup, it may be one of the cheapest Codex quota monitor solutions currently available.
+
+## What's new in 2.0
+
+- **Event-driven refresh**: local Codex state changes are watched and normally processed about one second after they occur; 30-second (active) and 60-second (idle) polling remains as a fallback.
+- **Shorter refresh wait**: the maximum trigger wait is reduced by about 29 seconds (about 97%) for active tasks and 59 seconds (about 98%) for idle tasks; the display itself still needs a few seconds for a full physical refresh.
+- **More stable task state**: running activity, activity continuation, plan-step progress, completion, failure, and unread reminders are recognized more reliably, reducing task-count oscillation.
+- **Lower-power BLE updates**: unchanged content skips scanning, connecting, and uploading, while small voltage fluctuations no longer trigger repeated full-screen updates, so battery life is expected to remain around three months.
+
+Current release: [Codex E-Ink Dashboard 2.0](https://github.com/627150795/codex-eink-dashboard/releases/tag/v2.0.0)
 
 ## How to read the screen
 
