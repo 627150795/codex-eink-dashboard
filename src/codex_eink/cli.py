@@ -28,7 +28,6 @@ from .sessions import SessionSnapshotCache, TitleSnapshotCache, collect_projects
 _LAST_SUCCESSFUL_LIVE_QUOTA: QuotaState | None = None
 # ponytail: fixed short poll until Codex exposes a quota-change event.
 _QUOTA_POLL_SECONDS = 60
-_QUOTA_RESET_MIN_PERCENT = 98
 
 
 @dataclasses.dataclass(frozen=True)
@@ -52,33 +51,12 @@ def _read_live_quota_with_retry() -> QuotaState | None:
                 time.sleep(0.25)
             continue
         if quota.primary or quota.secondary or (quota.plan_type or "").casefold() == "api":
-            quota = _stabilize_live_quota(_LAST_SUCCESSFUL_LIVE_QUOTA, quota)
+            # ponytail: successful server readings are authoritative; only failed reads use the last value.
             _LAST_SUCCESSFUL_LIVE_QUOTA = quota
             return quota
         if attempt == 0:
             time.sleep(0.25)
     return None
-
-
-def _stabilize_live_quota(previous: QuotaState | None, current: QuotaState) -> QuotaState:
-    if previous is None:
-        return current
-
-    def stable_window(previous_window, current_window):
-        if (
-            previous_window is not None
-            and current_window is not None
-            and current_window.remaining_percent > previous_window.remaining_percent
-            and current_window.remaining_percent < _QUOTA_RESET_MIN_PERCENT
-        ):
-            return previous_window
-        return current_window
-
-    primary = stable_window(previous.primary, current.primary)
-    secondary = stable_window(previous.secondary, current.secondary)
-    if primary is current.primary and secondary is current.secondary:
-        return current
-    return dataclasses.replace(current, primary=primary, secondary=secondary)
 
 
 def collect_view(

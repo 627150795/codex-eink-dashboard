@@ -55,24 +55,22 @@ class CollectViewTests(unittest.TestCase):
         self.assertEqual(view.quota, live_quota)
         fallback.assert_not_called()
 
-    def test_live_quota_rejects_partial_rebound(self):
-        for current_used, stale_used in ((100, 93), (60, 55), (10, 5)):
-            current_quota = QuotaState(primary=QuotaWindow(used_percent=current_used), plan_type="plus")
-            stale_quota = QuotaState(primary=QuotaWindow(used_percent=stale_used), plan_type="plus")
-            with self.subTest(current_used=current_used, stale_used=stale_used):
-                with (
-                    patch("codex_eink.cli.load_session_titles", return_value={}),
-                    patch("codex_eink.cli.load_state_titles", return_value={}),
-                    patch("codex_eink.cli.collect_projects", return_value=[]),
-                    patch("codex_eink.cli.load_recent_thread_activity", return_value={}),
-                    patch("codex_eink.cli.reconcile_live_activity", return_value=[]),
-                    patch("codex_eink.cli.read_live_quota", return_value=stale_quota),
-                    patch("codex_eink.cli.read_quota_fallback", side_effect=AssertionError("fallback used")),
-                    patch("codex_eink.cli._LAST_SUCCESSFUL_LIVE_QUOTA", current_quota),
-                ):
-                    view = collect_view(AppConfig(codex_home=Path("C:/codex-test")))
+    def test_live_quota_accepts_current_higher_remaining_value(self):
+        stale_quota = QuotaState(primary=QuotaWindow(used_percent=58), plan_type="plus")
+        live_quota = QuotaState(primary=QuotaWindow(used_percent=8), plan_type="plus")
+        with (
+            patch("codex_eink.cli.load_session_titles", return_value={}),
+            patch("codex_eink.cli.load_state_titles", return_value={}),
+            patch("codex_eink.cli.collect_projects", return_value=[]),
+            patch("codex_eink.cli.load_recent_thread_activity", return_value={}),
+            patch("codex_eink.cli.reconcile_live_activity", return_value=[]),
+            patch("codex_eink.cli.read_live_quota", return_value=live_quota),
+            patch("codex_eink.cli.read_quota_fallback", side_effect=AssertionError("stale fallback used")),
+            patch("codex_eink.cli._LAST_SUCCESSFUL_LIVE_QUOTA", stale_quota),
+        ):
+            view = collect_view(AppConfig(codex_home=Path("C:/codex-test")))
 
-                self.assertEqual(view.quota, current_quota)
+        self.assertEqual(view.quota.primary.remaining_percent, 92)
 
     def test_live_quota_accepts_reset_range(self):
         current_quota = QuotaState(primary=QuotaWindow(used_percent=100), plan_type="plus")
