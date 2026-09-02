@@ -1,13 +1,13 @@
 $ErrorActionPreference = 'Stop'
 $projectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
-$runner = Join-Path $projectRoot 'run-background.ps1'
+$launcher = Join-Path $projectRoot 'launch-hidden.vbs'
 $taskName = 'Codex E-Ink Dashboard'
-$powerShell = (Get-Command powershell.exe -ErrorAction Stop).Source
-$quotedRunner = '"' + $runner + '"'
+$wscript = Join-Path $env:WINDIR 'System32\wscript.exe'
+$quotedLauncher = '"' + $launcher + '"'
 
 $action = New-ScheduledTaskAction `
-    -Execute $powerShell `
-    -Argument "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File $quotedRunner"
+    -Execute $wscript `
+    -Argument $quotedLauncher
 $logonTrigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
 $watchdogTrigger = New-ScheduledTaskTrigger `
     -Once `

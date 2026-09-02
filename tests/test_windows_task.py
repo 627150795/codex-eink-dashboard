@@ -10,6 +10,7 @@ class WindowsTaskScriptTests(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.installer = (PROJECT_ROOT / "install-task.ps1").read_text(encoding="utf-8")
         cls.runner = (PROJECT_ROOT / "run-background.ps1").read_text(encoding="utf-8")
+        cls.launcher = (PROJECT_ROOT / "launch-hidden.vbs").read_text(encoding="utf-8")
 
     def test_task_is_allowed_to_run_on_battery(self) -> None:
         self.assertIn("-AllowStartIfOnBatteries", self.installer)
@@ -31,6 +32,12 @@ class WindowsTaskScriptTests(unittest.TestCase):
     def test_runner_loads_the_deployed_dashboard_config(self) -> None:
         self.assertIn("$configPath", self.runner)
         self.assertIn("--config $configPath", self.runner)
+
+    def test_task_uses_waiting_hidden_launcher(self) -> None:
+        self.assertIn("System32\\wscript.exe", self.installer)
+        self.assertIn("launch-hidden.vbs", self.installer)
+        self.assertIn("shell.Run(command, 0, True)", self.launcher)
+        self.assertIn("WScript.Quit exitCode", self.launcher)
 
 
 if __name__ == "__main__":
